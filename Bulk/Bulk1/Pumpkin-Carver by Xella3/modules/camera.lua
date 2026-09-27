@@ -1,0 +1,1 @@
+local function a(b)local c={x=0,y=0,z=0,rotX=0,rotY=0,rotZ=0,controller=b.cameraControllers.none()}function c:setPos(d,e,f,g,h,i)self.x=d or self.x;self.y=e or self.y;self.z=f or self.z;self.rotX=g or self.rotX;self.rotY=h or self.rotY;self.rotZ=i or self.rotZ end;function c:setController(j)self.controller=j;j:setCamera(self)end;return c end;return a

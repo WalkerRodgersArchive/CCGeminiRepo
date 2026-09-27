@@ -1,0 +1,265 @@
+--- A modular package manager.
+
+package.path = "/lib/?.lua;/lib/?;/lib/?/init.lua;" .. package.path
+local unicorn = {}
+--- Core logic for installing and uninstalling packages on the local system.
+--- !doctype module
+--- @class unicorn.core
+unicorn.core = {}
+unicorn.util = require("unicorn.util")
+
+local function is_installed(package_name)
+	if fs.exists("/etc/unicorn/packages/installed/" .. package_name) then
+		return true
+	else
+		return false
+	end
+end
+
+--- Stores a package table at '/etc/unicorn/packages/installed/{package_name}' with 'textutils.serialise'.
+---@param package_table table A valid package table.
+---@return boolean
+local function storePackageData(package_table)
+	unicorn.util.fileWrite(textutils.serialise(package_table), "/etc/unicorn/packages/installed/" .. package_table.name)
+	return is_installed(package_table.name)
+end
+
+--- Retrieves a package table stored at '/etc/unicorn/packages/installed/{package_name}' with 'textutils.unserialise'.
+---@param package_name string A valid name of a package.
+---@return table If the package table is present.
+local function getPackageData(package_name)
+	if is_installed(package_name) then
+		local file1 = fs.open("/etc/unicorn/packages/installed/" .. package_name, "r")
+		if file1 == nil then
+			return false
+		end
+		return textutils.unserialise(file1.readAll())
+	else
+		return false
+	end
+end
+
+--- Checks if the provided "package_table" is valid.
+-- This works by checking if "package_table.unicornSpec" is a valid value,
+-- and then checks if there are unfulfilled dependencies.
+local function check_valid(package_table)
+	assert(package_table, "Expected 1 argument, got 0")
+	assert(
+		package_table.unicornSpec,
+		"This package is lacking the unicornSpec value. Installation was aborted as a precautionary measure."
+	)
+	if package_table.rel and package_table.rel.depends then
+		for _, v in pairs(package_table.rel.depends) do
+			assert(is_installed(v), package_table.name .. " requires the " .. v .. " package. Installation aborted.")
+		end
+	end
+end
+
+--- Checks if a conflicting version of a package is installed.
+-- This checks if there is an equivalent or higher version of a package is installed.
+-- If one is not detected, installation continues.
+---@param package_table table A valid package table
+local function check_installable(package_table)
+	local existing_package = getPackageData(package_table.name)
+	if existing_package then
+		if existing_package.version and package_table.version then
+			local semver = require("semver")
+			if semver(existing_package.version) == semver(package_table.version) then
+				error(
+					"Same version of package is installed. Uninstall the currently installed package if you want to override."
+				)
+			elseif semver(existing_package.version) > semver(package_table.version) then
+				error("Newer version of package is installed. Uninstall the current package if you want to override.")
+			elseif semver(existing_package.version) < semver(package_table.version) then
+				unicorn.core.uninstall(existing_package.name)
+			end
+		end
+	end
+	if package_table.rel and package_table.rel.conflicts then
+		for _, conflict in ipairs(package_table.rel.conflicts) do
+			if is_installed(conflict) then
+				error(
+					"A package named "
+						.. conflict
+						.. " is installed, which conflicts with this package. Uninstall "
+						.. conflict
+						.. " if you want to proceed with installing this package."
+				)
+			end
+		end
+	end
+end
+
+--- Installs filemaps from a "package_table" using "pkgType".
+-- This function traverses "/lib/unicorn/provider" for a valid package provider.
+-- If found, it uses that provider to install files to the system.
+-- Otherwise, it errors.
+local function action_modular_providers(state, package_table)
+	local match, provider = pcall(require, "unicorn.provider." .. package_table.pkgType)
+	if match then
+		assert(
+			type(provider) == "function",
+			"The package provider "
+				.. package_table.pkgType
+				.. "is malformed (type should be function). Something is wrong with the provider's backend code. Unless you are writing your own provider, please report this error."
+		)
+		-- provider should fill state.filemaps
+		provider(state, package_table)
+	else
+		error(
+			"Package provider "
+				.. package_table.pkgType
+				.. " is unknown. You are either missing the appropriate package provider or something is wrong with the package."
+		)
+	end
+end
+
+--- Gets "package_script_name" from "package_table.script" and runs it.
+---@param package_table table A valid package table
+---@param package_script_name string A value that is either "preinstall", "postinstall", "preremove", or "postremove".
+local function action_script(package_table, package_script_name)
+	if package_table.script and package_table.script[package_script_name] then
+		local output, scriptError = load(package_table.script[package_script_name])()
+		if scriptError then
+			error(scriptError)
+		else
+			unicorn.util.logging.debug("Package script " .. package_script_name .. " returned " .. tostring(output))
+		end
+	end
+end
+
+local function install_filemaps(state)
+	for path, content in pairs(state.filemaps) do
+		unicorn.util.fileWrite(content, path)
+	end
+end
+
+local function action_check_hashes(state, package_table)
+	if package_table.security and package_table.security.sha256 then
+		local sha256 = require("ccryptolib.sha256")
+		local ccryptolib_util = require("ccryptolib.util")
+
+		for k, v in pairs(package_table.security.sha256) do
+			print(k)
+			print(v)
+			local digest = ccryptolib_util.toHex(sha256.digest(state.filemaps[k]))
+			print(digest)
+			if digest ~= v then
+				error(("Hash mismatch for %s: got %s, expected %s"):format(k, digest, v))
+			end
+		end
+	end
+end
+--- Creates folders from package_table.dirs
+---@param package_table table A valid package table
+local function action_make_folders(package_table)
+	if package_table.dirs then
+		for _, v in pairs(package_table.dirs) do
+			fs.makeDir(v)
+		end
+	end
+end
+
+--- Patches files to have a correct package.path if they contain `require`.
+---@param state table
+local function action_patch_package_path(state)
+	local patch = [[package.path = "/lib/?.lua;/lib/?;/lib/?/init.lua;" .. package.path]]
+	for k, v in pairs(state.filemaps) do
+		if k:find("%.lua$") and v:find("require") then
+			state.filemaps[k] = patch .. "\n" .. v
+		end
+	end
+end
+
+--- Installs a package from a package table.
+---
+--- Example
+--- ~~~~~~~
+--- Reads a package table from the disk and installs it.
+---
+--- .. DANGER::
+---    **This is insecure code.** This will execute the file at `/tmp/example_package`.
+---    You may want to consider evaluating `/tmp/example_package` in a sandbox, like
+---    the one provided with :func:`unicorn.util.evaluateInSandbox`.
+---
+--- >>> local unicorn = require("unicorn")
+--- >>> local file_1 = fs.open("/tmp/example_package")
+--- >>> local contents = file_1.readAll()
+--- >>> unicorn.core.install(dofile(contents))
+---@param package_table table A valid package table
+---@return boolean
+---@return table
+function unicorn.core.install(package_table)
+	-- This function is split up into "checks" and "actions".
+	-- Checks ensure that the operation can be completed,
+	-- and actions do things with values in the package table.
+
+	-- This table keeps track of all state.
+	local state = {}
+	state.filemaps = {}
+
+	-- assertion blocks
+	check_valid(package_table)
+
+	-- skips installation if the package is already installed, or if
+	-- a newer or equivalent version is installed
+	check_installable(package_table)
+
+	action_script(package_table, "preinstall")
+
+	-- make folders
+	action_make_folders(package_table)
+	-- modular provider loading and usage
+	action_modular_providers(state, package_table)
+	action_check_hashes(state, package_table)
+	action_patch_package_path(state)
+
+	install_filemaps(state)
+	action_script(package_table, "postinstall")
+
+	-- finish up
+	storePackageData(package_table)
+
+	os.queueEvent("UnicornInstall", package_table["name"])
+	unicorn.util.logging.info("Package " .. package_table.name .. " installed successfully.")
+	return true, package_table
+end
+
+local function action_delete_folders(package_table)
+	if package_table.dirs then
+		for _, v in pairs(package_table.dirs) do
+			if not next(fs.list(v)) then
+				fs.delete(v)
+			end
+		end
+	end
+end
+
+--- Removes a package from the system.
+--- It traverses package_table.instdat.filemaps and deletes everything.
+---
+--- Example
+--- ~~~~~~~
+---
+--- Uninstall a package named `example-package`.
+---
+--- >>> unicorn.core.uninstall("example-package")
+---@param package_name string The name of a package.
+---@return boolean
+function unicorn.core.uninstall(package_name)
+	local package_table = getPackageData(package_name)
+	action_script(package_table, "preremove")
+	if package_table.instdat and package_table.instdat.filemaps then
+		for _, v in pairs(package_table.instdat.filemaps) do
+			fs.delete(v)
+		end
+	end
+	action_delete_folders(package_table)
+	fs.delete("/etc/unicorn/packages/installed/" .. package_name)
+	action_script(package_table, "postremove")
+	unicorn.util.logging.info("Package " .. package_name .. " removed.")
+	os.queueEvent("UnicornUninstall", package_table["name"])
+	return true
+end
+
+return unicorn.core

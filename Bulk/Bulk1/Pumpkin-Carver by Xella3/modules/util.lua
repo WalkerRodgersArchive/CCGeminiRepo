@@ -1,0 +1,1 @@
+local a=require("Pine3D")local function b(c)local d={}for e=1,#c do local f=c[e]local g={x1=f.x1,y1=f.y1,z1=f.z1,x2=f.x2,y2=f.y2,z2=f.z2,x3=f.x3,y3=f.y3,z3=f.z3,forceRender=f.forceRender,c=f.c}d[e]=g end;for h,i in pairs(a.transforms)do d[h]=i end;return d end;return{quickModelCopy=b}

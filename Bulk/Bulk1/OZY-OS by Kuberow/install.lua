@@ -1,0 +1,12 @@
+shell.run("wget", "https://raw.github.com/Kuberow/OZY-OS/main/code/kernel.lua", "/kernel.lua")
+shell.run("wget", "https://raw.github.com/Kuberow/OZY-OS/main/code/bootloader/main.lua", "/startup.lua")
+print("Core Installed.")
+sleep(2)
+fs.makeDir("bin")
+fs.makeDir("autostart")
+shell.run("wget", "https://raw.github.com/Kuberow/OZY-OS/main/defcmd/help", "/bin/help")
+shell.run("wget", "https://raw.github.com/Kuberow/OZY-OS/main/defcmd/ozp", "/bin/ozp")
+shell.run("wget", "run", "https://raw.github.com/Kuberow/OZP/main/Lite/io.lua")
+shell.run("/bin/ozp", "install", "computerBasics")
+print("Fully Installed.")
+
